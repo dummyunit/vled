@@ -1,0 +1,143 @@
+#!/bin/bash
+
+exe_name="${0##*/}"
+
+error() { echo "$exe_name:" "$@" >&2; }
+die()   { error "$@"; exit 1; }
+
+IN_FIFO_PATH="/tmp/vledd.fifo_in"
+OUT_FIFO_PATH="/tmp/vledd.fifo_out"
+
+usage()
+{
+	[ $# -gt 0 ] && error "$@"
+	cat <<EOF >&2
+Usage: ${exe_name} [OPTIONS] COMMANDS...
+Connects to vled server and changes LED state according to COMMANDS.
+COMMANDS are executed in the order they specified.
+  
+Options:
+  -q, --quiet           quiet operation (do not report errors)
+  -v, --verbose         explain what is being done
+  -t, --timeout NUMBER  set timeout (in seconds) for connecting to server (default: 5)
+      --help            display this help and exit
+
+Comands:
+	on           turn LED on
+	off          turn LED off
+	color NAME   set LED color to NAME
+	rate NUMBER  set LED blinking rate to NUMBER
+	status       print LED status
+EOF
+	exit $#
+}
+
+getopt_out="$(getopt -o qvt: -l quiet,verbose,timeout:,help -n "${exe_name}" -- "$@")"
+[ $? -eq 0 ] || usage
+eval set -- "${getopt_out}"
+
+verbosity=1 #0 = quiet, 1 = default, 2 = verbose
+timeout=5
+
+# Process options
+while true; do
+    case "$1" in
+		-q|--quiet) verbosity=0; shift;;
+		-v|--verbose) verbosity=2; shift;;
+		-t|--timeout)
+			timeout="$2"
+			[ "$timeout" -gt 0 ] || usage "timeout must be positive"
+			shift 2;;
+		--help) usage; shift;;
+		--) shift; break;;
+		*) usage "unrecognized argument: $1";;
+	esac
+done
+
+[ $# -gt 0 ] || usage "no commands specified"
+
+ret_status=
+ret_result=
+
+send_command()
+{
+	echo "$@" >"$IN_FIFO_PATH"
+}
+
+read_response()
+{
+	# Have to use < <() instead of | to not run read in a subshell
+	read ret_status ret_result < <(head -n1 $OUT_FIFO_PATH)
+}
+
+cmd_success()
+{
+	[ "$ret_status" == OK ]
+}
+
+cmd_failure()
+{
+	[ "$ret_status" == FAILURE ]
+}
+
+# Process commands
+(
+	flock -x -w "$timeout" 9 || die "connection to server failed"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			on)
+				send_command "set-led-state" "on"
+				read_response
+				cmd_success && [ "$verbosity" -ge 2 ] && echo "LED turned on"
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to turn LED on"
+				shift
+			;;
+			off)
+				send_command "set-led-state" "off"
+				read_response
+				cmd_success && [ "$verbosity" -ge 2 ] && echo "LED turned off"
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to turn LED off"
+				shift
+			;;
+			color)
+				[ $# -ge 2 ] || die "command color requires an argument"
+				send_command "set-led-color" "$2"
+				read_response
+				cmd_success && [ "$verbosity" -ge 2 ] && echo "changed LED color to $2"
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to change LED color to $2"
+				shift 2
+			;;
+			rate)
+				[ $# -ge 2 ] || die "command rate requires an argument"
+				send_command "set-led-rate" "$2"
+				read_response
+				cmd_success && [ "$verbosity" -ge 2 ] && echo "changed LED blinking rate to $2"
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to change LED blinking rate to $2"
+				shift 2
+			;;
+			status)
+				send_command "get-led-state"
+				read_response
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to get LED state"
+				state=$ret_result
+
+				send_command "get-led-color"
+				read_response
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to get LED color"
+				color=$ret_result
+
+				send_command "get-led-rate"
+				read_response
+				cmd_failure && [ "$verbosity" -ge 1 ] && echo "failed to get LED color"
+				rate=$ret_result
+
+				echo "state: ${state:-unknown}, color: ${color:-unknown}, rate: ${rate:-unknown}"
+				shift
+			;;
+			*)
+				die "unrecognized command: $1"
+			;;
+		esac
+	done
+) 9>"$IN_FIFO_PATH"
+
